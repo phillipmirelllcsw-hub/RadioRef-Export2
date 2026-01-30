@@ -49,19 +49,30 @@ def setup_venv():
     if not os.path.exists(venv_dir):
         print("Creating virtual environment...")
         try:
-            subprocess.run(
+            result = subprocess.run(
                 [sys.executable, '-m', 'venv', venv_dir],
-                check=True,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
+                stderr=subprocess.PIPE,
+                timeout=120,  # 2 minute timeout
+                text=True
             )
+            if result.returncode != 0:
+                # Sanitize error output
+                error_msg = result.stderr[:200] if result.stderr else "Unknown error"
+                print(f"✗ Failed to create virtual environment")
+                print("Falling back to system Python (not recommended)")
+                return
             print("✓ Virtual environment created successfully!")
-        except subprocess.CalledProcessError as e:
-            print(f"✗ Failed to create virtual environment: {e}")
+        except subprocess.TimeoutExpired:
+            print("✗ Virtual environment creation timed out")
+            print("Falling back to system Python (not recommended)")
+            return
+        except FileNotFoundError:
+            print("✗ Python executable not found")
             print("Falling back to system Python (not recommended)")
             return
         except Exception as e:
-            print(f"✗ Error creating virtual environment: {e}")
+            print(f"✗ Error creating virtual environment: {type(e).__name__}")
             print("Falling back to system Python (not recommended)")
             return
     
@@ -121,6 +132,37 @@ def get_pip_command():
     return [sys.executable, '-m', 'pip']
 
 
+def validate_zip(zip_code):
+    """
+    Validate ZIP code format before using in web requests.
+    
+    Args:
+        zip_code: String to validate as ZIP code
+        
+    Returns:
+        str: Validated ZIP code
+        
+    Raises:
+        ValueError: If ZIP code is invalid
+    """
+    if not zip_code:
+        raise ValueError("ZIP code cannot be empty")
+    
+    # Remove whitespace
+    zip_code = zip_code.strip()
+    
+    # Check if it's 5 digits
+    if not (zip_code.isdigit() and len(zip_code) == 5):
+        raise ValueError("ZIP code must be exactly 5 digits")
+    
+    # Optional: Check if it's in valid range (00001-99950)
+    zip_int = int(zip_code)
+    if zip_int < 1 or zip_int > 99950:
+        raise ValueError("ZIP code out of valid range (00001-99950)")
+    
+    return zip_code
+
+
 def check_and_install_dependencies():
     missing_packages = []
     
@@ -149,35 +191,70 @@ def check_and_install_dependencies():
             playwright_installed = False
             for package in missing_packages:
                 print(f"  Installing {package}...")
-                result = subprocess.run(
-                    pip_cmd + ['install', '--quiet', package],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
-                )
+                
+                try:
+                    result = subprocess.run(
+                        pip_cmd + ['install', '--quiet', package],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=300  # 5 minute timeout per package
+                    )
+                except subprocess.TimeoutExpired:
+                    print(f"    ✗ Installation timed out for {package}")
+                    raise Exception(f"Package installation timed out: {package}")
+                except Exception as e:
+                    print(f"    ✗ Unexpected error installing {package}")
+                    raise Exception(f"Failed to install {package}: {type(e).__name__}")
+                
                 if result.returncode != 0:
+                    # Try with --user flag if not in venv
                     if not os.environ.get('VIRTUAL_ENV'):
-                        result = subprocess.run(
-                            pip_cmd + ['install', '--quiet', '--user', package],
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True
-                        )
+                        try:
+                            result = subprocess.run(
+                                pip_cmd + ['install', '--quiet', '--user', package],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True,
+                                timeout=300
+                            )
+                        except subprocess.TimeoutExpired:
+                            print(f"    ✗ Installation timed out for {package}")
+                            raise Exception(f"Package installation timed out: {package}")
+                    
+                    # If still failing, try upgrading pip first
                     if result.returncode != 0:
                         print(f"    Retrying with upgraded pip...")
-                        subprocess.run(
-                            pip_cmd + ['install', '--upgrade', '--quiet', 'pip'],
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE
-                        )
-                        result = subprocess.run(
-                            pip_cmd + ['install', '--quiet', package],
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True
-                        )
+                        try:
+                            subprocess.run(
+                                pip_cmd + ['install', '--upgrade', '--quiet', 'pip'],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                timeout=120,
+                                check=False  # Don't fail if pip upgrade fails
+                            )
+                            result = subprocess.run(
+                                pip_cmd + ['install', '--quiet', package],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True,
+                                timeout=300
+                            )
+                        except subprocess.TimeoutExpired:
+                            print(f"    ✗ Installation timed out for {package}")
+                            raise Exception(f"Package installation timed out: {package}")
+                        
                         if result.returncode != 0:
-                            raise subprocess.CalledProcessError(result.returncode, pip_name)
+                            # Sanitize error message - don't expose full system paths
+                            error_msg = result.stderr if result.stderr else "Unknown error"
+                            # Remove potential sensitive path information
+                            import re
+                            error_msg = re.sub(r'/[^\s]+/', '[PATH]/', error_msg)
+                            error_msg = re.sub(r'C:\\[^\s]+\\', '[PATH]\\', error_msg)
+                            
+                            print(f"    ✗ Failed to install {package}")
+                            print(f"    Error: {error_msg[:200]}")  # Limit error message length
+                            raise Exception(f"Could not install required package: {package}")
                 
                 if package == 'playwright':
                     playwright_installed = True
@@ -215,8 +292,12 @@ def check_and_install_dependencies():
                 except subprocess.TimeoutExpired:
                     print("  ⚠ Warning: Playwright browser installation timed out")
                     print("  You may need to run manually: python -m playwright install chromium")
+                except FileNotFoundError:
+                    print("  ⚠ Warning: Could not find Playwright executable")
+                    print("  You may need to run manually: python -m playwright install chromium")
                 except Exception as e:
-                    print(f"  ⚠ Warning: Error installing Playwright browsers: {e}")
+                    # Sanitize error message - don't expose system details
+                    print(f"  ⚠ Warning: Error installing Playwright browsers: {type(e).__name__}")
                     print("  You may need to run manually: python -m playwright install chromium")
             
             print("✓ All dependencies installed successfully!\n")
@@ -4044,14 +4125,24 @@ def run_cli_mode(args):
     elif args.weather:
         location_info = None
         if args.weather_zip:
-            print_status(f"Looking up location for ZIP: {args.weather_zip}", "info")
-            location_info = converter._get_location_from_zip(args.weather_zip)
-            if location_info:
-                print_status(f"Found: {location_info.get('city', 'N/A')}, {location_info.get('county', 'N/A')}, {location_info.get('state', 'N/A')}", "success")
+            try:
+                validated_zip = validate_zip(args.weather_zip)
+                print_status(f"Looking up location for ZIP: {validated_zip}", "info")
+                location_info = converter._get_location_from_zip(validated_zip)
+                if location_info:
+                    print_status(f"Found: {location_info.get('city', 'N/A')}, {location_info.get('county', 'N/A')}, {location_info.get('state', 'N/A')}", "success")
+            except ValueError as e:
+                print_status(f"Invalid ZIP code: {str(e)}", "error")
+                sys.exit(1)
         frequencies = converter.generate_noaa_weather_channels(location_info)
         print_status(f"Generated {len(frequencies)} NOAA Weather channels", "success")
     elif args.zipcode:
-        frequencies = converter.lookup_by_zipcode(args.zipcode)
+        try:
+            validated_zip = validate_zip(args.zipcode)
+            frequencies = converter.lookup_by_zipcode(validated_zip)
+        except ValueError as e:
+            print_status(f"Invalid ZIP code: {str(e)}", "error")
+            sys.exit(1)
     elif args.city:
         if not args.state:
             print_status("--state is required when using --city", "error")
@@ -4114,6 +4205,13 @@ def run_interactive_mode():
             zipcode = get_user_input("Enter ZIP code: ", Colors.INFO)
             if not zipcode:
                 print_status("ZIP code cannot be empty.", "error")
+                continue
+            
+            try:
+                zipcode = validate_zip(zipcode)
+            except ValueError as e:
+                print_status(f"Invalid ZIP code: {str(e)}", "error")
+                time.sleep(2)
                 continue
             
             output_file = get_user_input("Output filename (default: frequencies.csv): ", Colors.INFO)
@@ -4831,12 +4929,17 @@ def run_interactive_mode():
             location_info = None
             
             if location_choice:
-                print_status(f"Looking up location for ZIP: {location_choice}", "info")
-                location_info = converter._get_location_from_zip(location_choice)
-                if location_info:
-                    print_status(f"Found: {location_info.get('city', 'N/A')}, {location_info.get('county', 'N/A')}, {location_info.get('state', 'N/A')}", "success")
-                else:
-                    print_status("Could not determine location. Adding channels without location info.", "warning")
+                try:
+                    validated_zip = validate_zip(location_choice)
+                    print_status(f"Looking up location for ZIP: {validated_zip}", "info")
+                    location_info = converter._get_location_from_zip(validated_zip)
+                    if location_info:
+                        print_status(f"Found: {location_info.get('city', 'N/A')}, {location_info.get('county', 'N/A')}, {location_info.get('state', 'N/A')}", "success")
+                    else:
+                        print_status("Could not determine location. Adding channels without location info.", "warning")
+                except ValueError as e:
+                    print_status(f"Invalid ZIP code: {str(e)}", "error")
+                    print_status("Adding channels without location info.", "warning")
             
             output_file = get_user_input("Output filename (default: weather_channels.csv): ", Colors.INFO)
             if not output_file:
