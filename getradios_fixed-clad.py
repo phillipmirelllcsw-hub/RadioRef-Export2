@@ -3696,6 +3696,7 @@ class RadioRefToChirp:
         print_status(f"Searching for {county} County, {state}...", "info")
         
         try:
+            county_id = None
             query_url = f"{self.base_url}/db/query/?stid={state_id}"
             query_response = self.session.get(query_url, timeout=10)
             if query_response.status_code == 200:
@@ -4004,7 +4005,10 @@ class RadioRefToChirp:
                 break
         
         if not offset and duplex:
-            freq_val = float(re.search(r'(\d+\.\d+)', freq_text).group(1))
+            freq_match = re.search(r'(\d+\.\d+)', freq_text)
+            if not freq_match:
+                return (duplex, offset)
+            freq_val = float(freq_match.group(1))
             if 144 <= freq_val <= 148:
                 offset = '0.6' if duplex == '+' else '-0.6'
             elif 440 <= freq_val <= 450:
